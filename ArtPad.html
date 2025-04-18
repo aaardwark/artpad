@@ -1,0 +1,382 @@
+<!DOCTYPE html><html>
+    <head>
+        <!--
+            Made Jan 2023
+        -->
+        <title>ArtPad</title><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <!--
+            Need RepresentativE control points for the beziers
+                Come up with an algorithm or geometric means
+                Convert to js and insert into bezierify()
+                uncomment call to bezierify at dropInk
+
+
+            Palette icon/colour preview 
+                low opacity means that colour will be messed with by the grey/red background
+
+            KeyEvents as shortcuts
+                hold ctrl instead of mousedown
+                ctrl+z or ctrl+shift+z for undo redo
+                shortcuts for pendown, manipulating sliders, download
+
+            Save the last <number> of changes along with the svg and allow to open it from desktop and continue drawing
+
+            Add an eraser between the pen and colour
+                make any of the topnav items deselect the others when they are selected
+                eraser has to set the pentype to white and then set it back to its previous value when deselected
+
+        BEFORE anything else
+            Why does it take so long for mousemove to trigger when the cursor moves upwards
+        -->
+        <style>
+            #topnav {width:100%; height:60px; position:fixed; left:0px;top:0px;
+                background-color:#cccccc; 
+            }
+            #topnav > * {position:absolute;top:10px; padding:5px; text-align: center;
+                width:30px; height:30px; border-radius:5px;
+                font-size:30px; cursor:pointer;
+            }
+            #topnav > *:hover {box-shadow: 0px 0px 2px 2px #eeeeee;}
+            
+            button {appearance:none; border:none; background-color:#cccccc; box-sizing:inherit; padding:0px; font:'Times';}
+
+            #pentoggle {left:10px;}
+            #erasertoggle {left:60px;}
+            #showcolours {left:110px;}
+            #undoredo {right:60px;width:60px;height:40px;padding:0px;}
+            #undoredo:hover {box-shadow:none;}
+            #undoredo > * {width:28px; height:40px; position:absolute; font-size:25px;}
+            #undoredo > *:hover {box-shadow: 0px 0px 2px 2px #eeeeee;}
+            #undo {left:0px;}
+            #redo {right:0px;}
+            #save {right:10px;background-color: #39aff3;}
+            
+            #pad {position:fixed; top:70px;left:10px; z-index:-1;
+                background-color:white; box-shadow:0px 0px 10px 1px red;
+            }
+            #pickcolour {top:60px; left:0px; width:350px; z-index:1; position:relative; display:none;
+                font-size:13px; font-family:Arial, Helvetica, sans-serif;
+                background-color:white; border: 2px solid black;
+            }
+
+            td:nth-child(3) {width:26px; padding:2px; text-align:center;}
+            input[type=range] {width:200px}
+        </style>
+        <script src="Points.js"></script>
+        <script>
+            // START initialise globals used by script
+            var overPad=0, penOn=0, eraserOn=0, active=0;
+            var ActionHistory = [], history_position = -1, deleted_paths = [], pts = [];
+            const defltVals = {r:0,g:0,b:0,t:2,a:1};
+            var colour='rgb('+ defltVals.r +','+ defltVals.g +','+ defltVals.b +')', thickness=defltVals.t, opacity=defltVals.a;
+
+
+            onmousedown = (mdown)=>{
+                if (overPad && (penOn || eraserOn) ) {
+                    active=1;addPath(mousePos(mdown));
+                } else {
+                    active=0;
+                }
+            }
+            onmouseup = ()=>{active = 0;}
+            onmousemove = (mmove)=>{( active && mmove.movementX+mmove.movementY>0) ? dropInk(mousePos(mmove)) : null;}
+            // END initialise globals
+
+            function d(str) {return document.getElementById(str);} // getElementById shortcut
+            function s(el,attr,newval) {return el.setAttribute(attr, newval);} // setAttribute shortcut
+            function g(el,attr) {return el.getAttribute(attr);} // getAttribute shortcut
+
+            function mousePos(mouseInfo) { // converts viewport coordinates into svg coordinates (needed bc of topnav and shadow)
+                return new Point(mouseInfo.clientX-10, mouseInfo.clientY-70);
+            }
+//---
+            function closeTopnav() {
+                let topnavitems = Array.from( d('topnav').children ).slice(0,3);
+                for (c=0; c<topnavitems.length; c++) {
+                    ( topnavitems[c].style.backgroundColor == 'red' ) ? TOGGLE_topnavitems[c] : null;
+                }
+            }
+
+            function togglePen() {
+                (d('pickcolour').style.display =='inherit') ? toggleColours() : null;
+                eraserOn ? toggleEraser() : null;
+                
+                penOn = !penOn;
+                d('pentoggle').style.backgroundColor = penOn ? 'red': '#cccccc';
+            }
+
+            function toggleEraser() {
+                (penOn) ? togglePen() : null;
+                (d('pickcolour').style.display =='inherit') ? toggleColours() : null;
+
+                if (!eraserOn) {
+                    window.storedPenStyle = [colour, thickness, opacity];
+                    [colour, thickness, opacity] = ['#ffffff', 10, 1];
+                } else {
+                    [colour, thickness, opacity] = window.storedPenStyle;
+                }
+                eraserOn = !eraserOn;
+                d('erasertoggle').style.backgroundColor = eraserOn ? 'red': '#cccccc';
+            }
+
+            function toggleColours() {
+                penOn ? togglePen() : null;
+                eraserOn ? toggleEraser() : null;
+
+
+                let s = d('pickcolour').style;
+                s.display = (s.display == 'none') ? 'inherit' : 'none';
+                d('showcolours').style.backgroundColor = (s.display=='inherit') ? 'red': '#cccccc';
+            }
+//---
+            function saveDrawing() { // turns the 'pad' into an SVG file and downloads it
+                // adds attributes to the <svg> element to make it valid svg file content
+                if (g(pad, 'xmlns') == null) {
+                    s(pad, 'xmlns','http://www.w3.org/2000/svg');
+                    s(pad, 'xmlns:xlink','http://www.w3.org/1999/xlink')
+                    s(pad, 'version','1.1');
+                }
+
+                // removes the id and style attributes; generates filename based on time
+                const _svg = d('pad-div').innerHTML.replaceAll(/ (id|style)="[^"]+"/g, '');
+                const dateStr = (new Date()).toISOString().slice(0,-5).replaceAll(':','-').replace('T','_at_') + '.svg';
+                const filename = 'MyDrawing_' + dateStr;
+
+                // downloads SVG
+                let dl_link = document.createElement('a');
+                s(dl_link, 'download',filename);
+                s(dl_link, 'href','data:charset=utf-8,' + encodeURIComponent(_svg));
+                document.body.appendChild(dl_link);
+                dl_link.click();
+            }
+
+            function logActionHistoryItem(id, val) {
+                if (ActionHistory.length = history_position+1) {
+                    // if history_position is "in sync" with ActionHistory
+                    ActionHistory.push({id, val});
+                } else {
+                    // if undone action/s have to be overwritten
+                    ActionHistory.splice(history_position + 1, ActionHistory.length - history_position - 1, {id, val});
+                }
+                history_position ++;
+            }
+
+            function undo() {
+                let lastaction = ActionHistory[history_position];
+                ActionHistory.reverse();
+                let prevAssignment = ActionHistory.slice(ActionHistory.length - history_position).find(
+                    (item) => {return item.id == lastaction.id}
+                );
+                ActionHistory.reverse();
+
+                if (lastaction) {
+                    if (prevAssignment) {
+                        // when this id appears in history, i.e. it has been changed before
+                        let target = d(prevAssignment.id);
+                        target.value = prevAssignment.val;
+                        setPenType({target});
+
+                    } else {
+                        // for when this id does not appear in history, i.e. it has not been modified
+                        if ( /^.$/.test(lastaction.id) ) {
+                            // when this id is for a style picker
+                            let target = d(lastaction.id)
+                            target.value = defltVals[lastaction.id];
+                            setPenType({target});
+
+                        } else {
+                            // when this id is a path's id
+                            let last_path = d(lastaction.id);
+                            deleted_paths.push(last_path);
+                            pad.removeChild(last_path);
+                        }
+                    }
+                    history_position --;
+                } else {
+                    // Nothing to undo
+                }
+            }
+
+            function redo() {
+                if (history_position < ActionHistory.length - 1) {
+                    // if history_position and ActionHistory are NOT in sync
+                    let nextaction = ActionHistory[history_position + 1];
+
+                    if ( /^.$/.test(nextaction.id) ) {
+                        // where the next action is on a style picker
+                        let target = d(nextaction.id);
+                        target.value = nextaction.val;
+                        setPenType({target});
+                    } else {
+                        // where the next action is on a path
+                        pad.appendChild(deleted_paths.pop());
+                    }
+                    history_position ++;
+                } else {
+                    // nothing to redo
+                }
+            }
+            
+            function addPath(startcoords) { // creates new svg path element with colour, thickness as selected
+                var p = document.createElement('path');
+                let pathid = (new Date()).getTime();
+                s(p,'id',pathid);
+                s(p,'stroke',colour);
+                s(p,'stroke-width',thickness);
+                s(p,'fill','none');
+                s(p,'opacity',opacity);
+                s(p,'d','M ' + startcoords.x + ' ' + startcoords.y);
+
+                if (!pad.lastChild || g(pad.lastChild, 'd').indexOf('L') > -1 ) {
+                    pad.appendChild(p);
+                } else {
+                    pad.replaceChild(p,pad.lastChild);
+                    var blankpath_index = arrayfind(ActionHistory, (v,i,a)=>{return v.val==null}, true).index;
+                    ActionHistory.splice(blankpath_index, 1);
+                    history_position--;
+                }
+                logActionHistoryItem(pathid,null);
+
+                pts = [startcoords]; // to reset the list of points in the path
+            }
+
+            function dropInk(coords) { 
+                // adds segment to path based on coordinates passed my mousemove handler
+                pts.push(coords);
+                (pts.length == 4) ? bezierifyPrev() : null; 
+
+                let currentPath = g(pad.lastChild, 'd');
+                s(pad.lastChild, 'd', currentPath + ' L ' + coords.x + ' ' + coords.y);
+                pad.innerHTML = pad.innerHTML;
+            }
+            
+            function bezierifyPrev() { 
+                // changes previous Lineto into cubic-bezier, once the next point (needed as control) is known
+                var ctrlTwo = pts[3].halfwayto(pts[2]).mirror(pts[2]);
+
+                var nextCommand;
+                if (g(pad.lastChild, 'd').indexOf('C') == -1) {
+                    var ctrlOne = pts[0].halfwayto(pts[1]).mirror(pts[1]);
+                    nextCommand = 'C ' + ctrlOne.toString() +', '+ ctrlTwo.toString() +', '+ pts[2].toString();
+                } else {
+                    nextCommand = 'S ' + ctrlTwo.toString() +', '+ pts[2].toString();
+                }
+
+                pts.shift();                
+                
+                const lastSegment = /L[^L]+$/;
+                let currentPath = g(pad.lastChild, 'd');
+                s(pad.lastChild, 'd', currentPath.replace(lastSegment, nextCommand) );
+
+                pad.innerHTML = pad.innerHTML;
+            }
+            
+            function arrayfind(array, callback, findlast=false) {
+                if (array.constructor.name != 'Array') {
+                    console.error('Uncaught TypeError: ' + array + ' is not an array')
+                } else if (typeof callback !='function') {
+                    console.error('Uncaught TypeError: ' + callback + ' is not a function')
+                }
+
+                for (i=0;i<array.length;i++) {
+                    j = findlast ? array.length - i - 1 : i;
+                    if (callback(array[j], j, array)) {
+                        return {value:array[j], index:j}
+                    }
+                }
+            }
+        </script>
+    </head>
+
+
+    <body>
+        <div id="topnav">
+            <button onclick="togglePen()" id="pentoggle" title="Toggle pen">🖊️</button>
+            <button onclick="toggleEraser()" id="erasertoggle" title="Toggle eraser">e</button>
+            <button onclick="toggleColours()" id="showcolours" title="Show colour picker">🎨</button>
+            <div id="undoredo">
+                <button id="undo" title="Undo" onclick="undo()">&#x293a</button>
+                <button id="redo" title="Redo" onclick="redo()">&#x293b</button>
+            </div>
+            <button onclick="saveDrawing()" id="save" title="Download drawing">&#x2913</button>
+        </div>
+        <div id="pad-div"> <svg id="pad"></svg> </div>
+
+        <div id="pickcolour">
+            <table>
+                <tr> 
+                    <td> <label for="r">Red:</label> </td> 
+                    <td><input id="r" type="range" min="0" max="255" value="0" /></td> <td id="rv">0</td>
+                    <td rowspan="5">
+                        <svg width="40" height="60">
+                        <line id="penpreview" opacity="1" stroke="black" stroke-width="5" fill="none" x1="20" y1="0" x2="20" y2="60"/>
+                        </svg> 
+                    </td>
+
+                </tr>
+                <tr> 
+                    <td> <label for="g">Green:</label> </td> 
+                    <td><input id="g" type="range" min="0" max="255" value="0" /></td> <td id="gv">0</td> 
+                </tr>
+                <tr> 
+                    <td> <label for="b">Blue:</label> </td> 
+                    <td><input id="b" type="range" min="0" max="255" value="0" /></td> <td id="bv">0</td>
+                </tr>
+                <tr> 
+                    <td> <label for="a">Opacity:</label> </td> 
+                    <td><input id="a" type="range" min="0" max="1" value="1" step="0.01" /></td> <td id="av">1</td>
+                </tr>
+                <tr> 
+                    <td> <label for="t">Thickness:</label> </td> 
+                    <td><input id="t" type="range" min="1" max="20" value="2" /></td> <td id="tv">2</td>
+                </tr>
+            </table>
+        </div>
+
+
+        <script>
+            // this whole script assigns DOM dependent variables and functions
+            var pad = d('pad');
+            s(pad, 'width',innerWidth-20); s(pad, 'height',innerHeight-80);
+            d('pickcolour').style.display = 'none';
+
+            pad.onmouseenter = pad.onmouseleave = function (mouseEv) { 
+                // to detect when mouse enters/leaves the pad, stores whether mouse is over the pad as a boolean
+                var mouseElem = document.elementFromPoint(mouseEv.clientX, mouseEv.clientY);
+                try {
+                    overPad = ( [pad,d('pad-div')].indexOf(mouseElem.parentElement) > -1) ? 1 : 0;
+                } catch {}
+                // sets css cursor property of pad to pen image if pen is on
+                pad.style.cursor = penOn ? "url('ArtPadBrush.png') 0 0, default" : eraserOn ? 'crosshair, default' : 'default';
+            }
+
+
+            function setPenType(change) {
+                // sets variables which control the next path's style
+                colour = 'rgb(' + d('r').value +','+ d('g').value +','+ d('b').value + ')';
+                opacity = d('a').value;
+                thickness = d('t').value;
+
+                // displays new value/s
+                let changeid = change.target.id;
+                d(changeid + 'v').innerText = d(changeid).value;
+
+                // logs change if NOT called by undo/redo; uses the object passed to tell which one called
+                if (Object.keys( change.constructor ).length > 0) {
+                    logActionHistoryItem(changeid, d(changeid).value)
+                }
+                // shows preview of the new value/s
+                let st = d('penpreview').style;
+                st.strokeWidth = thickness;
+                st.stroke = colour;
+                st.opacity = opacity;
+            }
+
+            d('r').onchange = d('g').onchange = d('b').onchange = d('a').onchange = d('t').onchange = setPenType;
+
+        </script>
+
+
+
+    </body>
+</html>
